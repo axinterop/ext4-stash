@@ -17,7 +17,12 @@
 #define PROC_DIR "ext4_stash"
 #define PROC_HIDE "hide"
 #define PROC_UNHIDE "unhide"
+#define PROC_CLEAR "clear"
 #define MAX_MSG_SIZE 255
+
+#define OP_READ 0
+#define OP_WRITE 1
+#define OP_CLEAR 2
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("201295");
@@ -27,14 +32,13 @@ static u64 unhide_phys_block = 0;
 static int unhide_offset = 0;
 static DEFINE_MUTEX(stash_mutex);
 
-static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, char *data, int data_len, bool do_write) {
+static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, char *data, int data_len, int mode) {
     struct buffer_head *bh;
     int ret = 0;
     int slack_avail;
 
     if (!sb) return -EINVAL;
 
-    // read the raw physical block from the device
     bh = sb_bread(sb, phys_block);
     if (!bh) {
         pr_err("[%s] I/O Error: Cannot read physical block %llu\n", MODULE_NAME, phys_block);
@@ -46,7 +50,7 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
     lock_buffer(bh);
     unsigned char *ptr = (unsigned char *)bh->b_data;
 
-    if (do_write) {
+    if (mode == OP_WRITE) {
         // [Len][Data]
         if (data_len + 1 > slack_avail) {
             unlock_buffer(bh);
@@ -55,11 +59,16 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
         }
         ptr[offset] = (unsigned char)data_len;
         memcpy(ptr + offset + 1, data, data_len);
+        mark_buffer_dirty(bh);
 
+    } else if (mode == OP_CLEAR) {
+        // data arguments are ignored for clear mode
+        // oerwrite the entire slack space with zeros
+        memset(ptr + offset, 0, slack_avail);
         mark_buffer_dirty(bh);
 
     } else {
-        // Read
+        // read logic
         int stored_len = ptr[offset];
         if (stored_len < 0) stored_len = 0;
         if (stored_len > MAX_MSG_SIZE) stored_len = MAX_MSG_SIZE;
@@ -72,13 +81,16 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
         }
     }
 
-    // unlock buffer BEFORE sync to avoid waiting
     unlock_buffer(bh);
 
-    if (do_write) {
+    // sync if we modified the buffer
+    if (mode == OP_WRITE || mode == OP_CLEAR) {
         ret = sync_dirty_buffer(bh);
         if (ret == 0) {
-            pr_info("[%s] Hidden %d bytes in phys block %llu\n", MODULE_NAME, data_len, phys_block);
+            if (mode == OP_CLEAR)
+                pr_info("[%s] Cleared slack space in phys block %llu\n", MODULE_NAME, phys_block);
+            else
+                pr_info("[%s] Hidden %d bytes in phys block %llu\n", MODULE_NAME, data_len, phys_block);
         }
     }
 
@@ -86,7 +98,6 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
     return ret;
 }
 
-// --- Proc: Hide ---
 static ssize_t hide_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char *kbuf, *p;
     char *path_s, *phys_s, *off_s, *data_s;
@@ -97,45 +108,32 @@ static ssize_t hide_write(struct file *file, const char __user *ubuf, size_t cou
 
     if (count == 0 || count > PAGE_SIZE) return -EINVAL;
 
-    // SAFE COPY: Ensures null-termination and prevents boundary bugs
     kbuf = memdup_user_nul(ubuf, count);
     if (IS_ERR(kbuf)) return PTR_ERR(kbuf);
 
-    // SAFE PARSING: Use strsep to tokenize
     p = kbuf;
     path_s = strsep(&p, "\n");
     phys_s = strsep(&p, "\n");
     off_s  = strsep(&p, "\n");
     data_s = strsep(&p, "\n");
 
-
     if (!path_s || !phys_s || !off_s || !data_s) {
-        kfree(kbuf);
-        return -EINVAL; // Malformed input
+        kfree(kbuf); return -EINVAL;
     }
 
     if (kstrtoull(phys_s, 10, &phys_block) || kstrtouint(off_s, 10, &offset)) {
-        kfree(kbuf);
-        return -EINVAL;
+        kfree(kbuf); return -EINVAL;
     }
 
-    // pr_info("[%s] %s %d %d %s\n", MODULE_NAME, path_s, phys_block, offset, data_s);
-
-
-    // We open the file just to get the Superblock reference
     filp = filp_open(path_s, O_RDONLY, 0);
     if (IS_ERR(filp)) {
-        kfree(kbuf);
-        return PTR_ERR(filp);
+        kfree(kbuf); return PTR_ERR(filp);
     }
 
-    pr_info("[%s] filp_open was successful.\n", MODULE_NAME);
-
-    //
     mutex_lock(&stash_mutex);
-    ret = raw_block_access(file_inode(filp)->i_sb, phys_block, offset, data_s, strlen(data_s), true);
+    ret = raw_block_access(file_inode(filp)->i_sb, phys_block, offset, data_s, strlen(data_s), OP_WRITE);
     mutex_unlock(&stash_mutex);
-    //
+
     filp_close(filp, NULL);
     kfree(kbuf);
     return (ret < 0) ? ret : count;
@@ -143,7 +141,49 @@ static ssize_t hide_write(struct file *file, const char __user *ubuf, size_t cou
 
 static const struct proc_ops hide_ops = { .proc_write = hide_write };
 
-// --- Proc: Unhide ---
+static ssize_t clear_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
+    char *kbuf, *p;
+    char *path_s, *phys_s, *off_s;
+    u64 phys_block;
+    int offset;
+    struct file *filp;
+    int ret;
+
+    if (count == 0 || count > PAGE_SIZE) return -EINVAL;
+
+    kbuf = memdup_user_nul(ubuf, count);
+    if (IS_ERR(kbuf)) return PTR_ERR(kbuf);
+
+    p = kbuf;
+    path_s = strsep(&p, "\n");
+    phys_s = strsep(&p, "\n");
+    off_s  = strsep(&p, "\n");
+
+    if (!path_s || !phys_s || !off_s) {
+        kfree(kbuf); return -EINVAL;
+    }
+
+    if (kstrtoull(phys_s, 10, &phys_block) || kstrtouint(off_s, 10, &offset)) {
+        kfree(kbuf); return -EINVAL;
+    }
+
+    filp = filp_open(path_s, O_RDONLY, 0);
+    if (IS_ERR(filp)) {
+        kfree(kbuf); return PTR_ERR(filp);
+    }
+
+    mutex_lock(&stash_mutex);
+    ret = raw_block_access(file_inode(filp)->i_sb, phys_block, offset, NULL, 0, OP_CLEAR);
+    mutex_unlock(&stash_mutex);
+
+    filp_close(filp, NULL);
+    kfree(kbuf);
+    return (ret < 0) ? ret : count;
+}
+
+static const struct proc_ops clear_ops = { .proc_write = clear_write };
+
+
 static ssize_t unhide_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char *kbuf, *p;
     char *path_s, *phys_s, *off_s;
@@ -175,14 +215,13 @@ static ssize_t unhide_read(struct file *file, char __user *ubuf, size_t count, l
     struct file *filp;
     int ret;
 
-    if (*ppos > 0) return 0; // EOF
+    if (*ppos > 0) return 0;
 
     data_buf = kzalloc(MAX_MSG_SIZE + 1, GFP_KERNEL);
     if (!data_buf) return -ENOMEM;
 
     mutex_lock(&stash_mutex);
 
-    // Re-open to ensure we have a valid SB reference
     filp = filp_open(unhide_path_store, O_RDONLY, 0);
     if (IS_ERR(filp)) {
         mutex_unlock(&stash_mutex);
@@ -190,7 +229,7 @@ static ssize_t unhide_read(struct file *file, char __user *ubuf, size_t count, l
         return -EINVAL;
     }
 
-    ret = raw_block_access(file_inode(filp)->i_sb, unhide_phys_block, unhide_offset, data_buf, MAX_MSG_SIZE, false);
+    ret = raw_block_access(file_inode(filp)->i_sb, unhide_phys_block, unhide_offset, data_buf, MAX_MSG_SIZE, OP_READ);
 
     filp_close(filp, NULL);
     mutex_unlock(&stash_mutex);
@@ -203,11 +242,8 @@ static ssize_t unhide_read(struct file *file, char __user *ubuf, size_t count, l
     data_buf[ret] = '\n';
     ret++;
 
-    if (copy_to_user(ubuf, data_buf, ret)) {
-        ret = -EFAULT;
-    } else {
-        *ppos += ret;
-    }
+    if (copy_to_user(ubuf, data_buf, ret)) ret = -EFAULT;
+    else *ppos += ret;
 
     kfree(data_buf);
     return ret;
@@ -215,19 +251,20 @@ static ssize_t unhide_read(struct file *file, char __user *ubuf, size_t count, l
 
 static const struct proc_ops unhide_ops = { .proc_write = unhide_write, .proc_read = unhide_read };
 
-// --- Init/Exit ---
 static struct proc_dir_entry *proc_dir;
 static int __init stash_init(void) {
     proc_dir = proc_mkdir(PROC_DIR, NULL);
     if (!proc_dir) return -ENOMEM;
     proc_create(PROC_HIDE, 0666, proc_dir, &hide_ops);
     proc_create(PROC_UNHIDE, 0666, proc_dir, &unhide_ops);
+    proc_create(PROC_CLEAR, 0666, proc_dir, &clear_ops);
     pr_info("[%s] Loaded successfully.\n", MODULE_NAME);
     return 0;
 }
 static void __exit stash_exit(void) {
     remove_proc_entry(PROC_HIDE, proc_dir);
     remove_proc_entry(PROC_UNHIDE, proc_dir);
+    remove_proc_entry(PROC_CLEAR, proc_dir);
     remove_proc_entry(PROC_DIR, NULL);
     pr_info("[%s] Unloaded.\n", MODULE_NAME);
 }
