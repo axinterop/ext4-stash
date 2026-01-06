@@ -1,47 +1,38 @@
-obj-m += hide_module.o
+# Target names
+MODULE_NAME := ext4_stash
+CLI_NAME := stash_cli
 
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+# Kernel build variables
+obj-m += $(MODULE_NAME).o
+KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-# all: module utility
-all: module
+# Compilation flags for CLI
+CC := gcc
+CFLAGS := -Wall -O2
 
+all: module cli
+
+# Compile the Kernel Module
 module:
-	make -C $(KERNELDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-utility: hide_util.c
-	gcc -Wall -o hide hide_util.c
+# Compile the Userspace CLI
+cli: cli.c
+	$(CC) $(CFLAGS) cli.c -o $(CLI_NAME)
 
+# Remove build artifacts
 clean:
-	make -C $(KERNELDIR) M=$(PWD) clean
-	rm -f hide
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(CLI_NAME)
 
-load: module
-	sudo insmod hide_module.ko
-	sudo chmod 666 /dev/hide_device
+# Helper to load the module (requires sudo)
+load:
+	sudo insmod $(MODULE_NAME).ko
+	sudo chmod 666 /proc/ext4_stash/hide /proc/ext4_stash/unhide
 
+# Helper to unload the module (requires sudo)
 unload:
-	sudo rmmod hide_module 2>/dev/null || true
+	sudo rmmod $(MODULE_NAME)
 
-logs:
-	sudo dmesg | tail -20
-
-test: all load
-	@echo "Module loaded. Testing..."
-	@echo "Creating test files..."
-	dd if=/dev/zero of=/tmp/container.bin bs=1024 count=10
-	echo "Secret test data 123!" > /tmp/secret.txt
-	@echo ""
-	@echo "Hiding /tmp/secret.txt into /tmp/container.bin..."
-	sudo ./hide /tmp/container.bin /tmp/secret.txt
-	@echo ""
-	@echo "Retrieving hidden data..."
-	sudo ./hide -r /tmp/container.bin /tmp/recovered.txt 21
-	@echo ""
-	@echo "Checking recovered data:"
-	cat /tmp/recovered.txt
-	@echo ""
-
-rebuild: clean all
-
-.PHONY: all module utility clean load unload logs test rebuild
+.PHONY: all module cli clean load unload

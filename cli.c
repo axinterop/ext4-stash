@@ -3,97 +3,129 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <limits.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <linux/fiemap.h>
+#include <sys/stat.h>
 
 #define PROC_HIDE "/proc/ext4_stash/hide"
 #define PROC_UNHIDE "/proc/ext4_stash/unhide"
 
-void usage(const char *prog) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s hide <abs_filepath> <message>\n", prog);
-    fprintf(stderr, "  %s unhide <abs_filepath>\n", prog);
-    exit(1);
+// --- Helper: Map Logical Offset to Physical Block ---
+// This handles the "Hard Part" that the kernel 6.x API complicates
+int get_slack_info(const char *path, unsigned long long *phys_block, int *offset) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("Error opening target file");
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat failed");
+        close(fd); return -1;
+    }
+
+    int block_size = st.st_blksize;
+    int off = st.st_size % block_size;
+
+    printf("%d, %d\n", block_size, off);
+
+    if (off == 0) {
+        fprintf(stderr, "Error: No slack space (file size %ld aligns with block %d).\n", st.st_size, block_size);
+        close(fd); return -2;
+    }
+    *offset = off;
+
+    // Use FIEMAP (Stable Userspace API)
+    struct fiemap *fiemap;
+    int extents_size = sizeof(struct fiemap_extent);
+    fiemap = malloc(sizeof(struct fiemap) + extents_size);
+
+    memset(fiemap, 0, sizeof(struct fiemap) + extents_size);
+    fiemap->fm_start = (st.st_size / block_size) * block_size; // Start of last block
+    fiemap->fm_length = block_size;
+    fiemap->fm_flags = FIEMAP_FLAG_SYNC;
+    fiemap->fm_extent_count = 1;
+
+    // printf("%d, %d, %d, %d\n", sizeof(struct fiemap), extents_size, fiemap->fm_start, fiemap->fm_length);
+
+    if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
+        perror("ioctl FIEMAP failed (Is this a real ext4 partition?)");
+        free(fiemap); close(fd); return -1;
+    }
+
+    if (fiemap->fm_mapped_extents == 0) {
+        fprintf(stderr, "Error: Block not mapped (Sparse file or resident in inode).\n");
+        free(fiemap); close(fd); return -1;
+    } else if (fiemap->fm_mapped_extents > 1) {
+        fprintf(stderr, "Undefined: More than 1 extent were mapped.\n");
+        free(fiemap); close(fd); return -1;
+    }
+
+
+    *phys_block = fiemap->fm_extents[0].fe_physical / block_size;
+
+    free(fiemap);
+    close(fd);
+    return 0;
 }
 
 void do_hide(const char *path, const char *msg) {
-    int fd = open(PROC_HIDE, O_WRONLY);
-    if (fd < 0) {
-        perror("Error opening kernel module interface");
-        fprintf(stderr, "Is ext4_stash.ko loaded?\n");
-        exit(1);
-    }
+    unsigned long long phys_block;
+    int offset;
 
-    // Format: "path\nmsg"
-    // Note: Kernel module expects strict single write logic for simplicity
+    if (get_slack_info(path, &phys_block, &offset) != 0) exit(1);
+
     char buffer[4096];
-    snprintf(buffer, sizeof(buffer), "%s\n%s", path, msg);
+    // Protocol: path \n phys \n off \n msg
+    // Kernel uses strsep to parse this safely
+    snprintf(buffer, sizeof(buffer), "%s\n%llu\n%d\n%s", path, phys_block, offset, msg);
 
-    int len = strlen(buffer);
-    if (write(fd, buffer, len) < 0) {
-        perror("Error writing to slack space");
-    } else {
-        printf("Success: Data hidden in slack space of %s\n", path);
-    }
+    int fd = open(PROC_HIDE, O_WRONLY);
+    if (fd < 0) { perror("Module /proc/hide missing"); exit(1); }
+
+    if (write(fd, buffer, strlen(buffer)) < 0) perror("Write failed");
+    else printf("Success: Hidden in block %llu (offset %d)\n", phys_block, offset);
 
     close(fd);
 }
 
 void do_unhide(const char *path) {
-    int fd_write = open(PROC_UNHIDE, O_WRONLY);
-    if (fd_write < 0) {
-        perror("Error opening kernel module interface (write)");
-        exit(1);
-    }
+    unsigned long long phys_block;
+    int offset;
 
-    // Step 1: Tell kernel which file to target
-    if (write(fd_write, path, strlen(path)) < 0) {
-        perror("Error setting target file");
-        close(fd_write);
-        exit(1);
-    }
+    if (get_slack_info(path, &phys_block, &offset) != 0) exit(1);
+
+    char buffer[4096];
+    snprintf(buffer, sizeof(buffer), "%s\n%llu\n%d", path, phys_block, offset);
+
+    int fd_write = open(PROC_UNHIDE, O_WRONLY);
+    if (fd_write < 0) { perror("Module /proc/unhide missing"); exit(1); }
+    write(fd_write, buffer, strlen(buffer));
     close(fd_write);
 
-    // Step 2: Read the result
     int fd_read = open(PROC_UNHIDE, O_RDONLY);
-    if (fd_read < 0) {
-        perror("Error opening kernel module interface (read)");
-        exit(1);
-    }
+    if (fd_read < 0) { perror("Read failed"); exit(1); }
 
-    char buffer[1024];
-    int bytes = read(fd_read, buffer, sizeof(buffer) - 1);
-    if (bytes < 0) {
-        perror("Error reading hidden data");
-    } else if (bytes == 0) {
-        printf("No data found or empty.\n");
+    int len = read(fd_read, buffer, sizeof(buffer)-1);
+    if (len > 0) {
+        buffer[len] = 0;
+        printf("Recovered: %s", buffer);
     } else {
-        buffer[bytes] = '\0';
-        // Note: Kernel adds a newline for us
-        printf("Recovered data: %s", buffer);
+        printf("No data found.\n");
     }
-
     close(fd_read);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) usage(argv[0]);
-
-    const char *cmd = argv[1];
-    const char *path = argv[2];
-
-    if (path[0] != '/') {
-        fprintf(stderr, "Error: File path must be absolute (start with /)\n");
-        exit(1);
+    if (argc < 3) {
+        printf("Usage: %s hide <abs_path> <msg>\n", argv[0]);
+        printf("       %s unhide <abs_path>\n", argv[0]);
+        return 1;
     }
-
-    if (strcmp(cmd, "hide") == 0) {
-        if (argc < 4) usage(argv[0]);
-        do_hide(path, argv[3]);
-    } else if (strcmp(cmd, "unhide") == 0) {
-        do_unhide(path);
-    } else {
-        usage(argv[0]);
-    }
-
+    if (strcmp(argv[1], "hide") == 0 && argc >= 4) do_hide(argv[2], argv[3]);
+    else if (strcmp(argv[1], "unhide") == 0) do_unhide(argv[2]);
+    else printf("Invalid command.\n");
     return 0;
 }
