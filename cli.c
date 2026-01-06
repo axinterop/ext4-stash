@@ -37,13 +37,13 @@ int get_slack_info(const char *path, unsigned long long *phys_block, int *offset
     }
     *offset = off;
 
-    // Use FIEMAP (Stable Userspace API)
+    // Use FIEMAP (userspace API)
     struct fiemap *fiemap;
     int extents_size = sizeof(struct fiemap_extent);
     fiemap = malloc(sizeof(struct fiemap) + extents_size);
 
     memset(fiemap, 0, sizeof(struct fiemap) + extents_size);
-    fiemap->fm_start = (st.st_size / block_size) * block_size; // Start of last block
+    fiemap->fm_start = (st.st_size / block_size) * block_size; // start of last block
     fiemap->fm_length = block_size;
     fiemap->fm_flags = FIEMAP_FLAG_SYNC;
     fiemap->fm_extent_count = 1;
@@ -79,7 +79,6 @@ void do_hide(const char *path, const char *msg) {
 
     char buffer[4096];
     // Protocol: path \n phys \n off \n msg
-    // Kernel uses strsep to parse this safely
     snprintf(buffer, sizeof(buffer), "%s\n%llu\n%d\n%s", path, phys_block, offset, msg);
 
     int fd = open(PROC_HIDE, O_WRONLY);

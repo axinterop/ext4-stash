@@ -22,13 +22,11 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("201295");
 
-// Global state for unhide
 static char unhide_path_store[PATH_MAX];
 static u64 unhide_phys_block = 0;
 static int unhide_offset = 0;
 static DEFINE_MUTEX(stash_mutex);
 
-// --- Helper: Low-Level Block Access ---
 static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, char *data, int data_len, bool do_write) {
     struct buffer_head *bh;
     int ret = 0;
@@ -36,7 +34,7 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
 
     if (!sb) return -EINVAL;
 
-    // Read the raw physical block from the device
+    // read the raw physical block from the device
     bh = sb_bread(sb, phys_block);
     if (!bh) {
         pr_err("[%s] I/O Error: Cannot read physical block %llu\n", MODULE_NAME, phys_block);
@@ -74,6 +72,7 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
         }
     }
 
+    // unlock buffer BEFORE sync to avoid waiting
     unlock_buffer(bh);
 
     if (do_write) {
