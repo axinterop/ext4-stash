@@ -24,6 +24,9 @@
 #define OP_WRITE 1
 #define OP_CLEAR 2
 
+#define MAGIC_BYTE_1 0x53  // 'S'
+#define MAGIC_BYTE_2 0x54  // 'T'
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("201295");
 
@@ -51,14 +54,16 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
     unsigned char *ptr = (unsigned char *)bh->b_data;
 
     if (mode == OP_WRITE) {
-        // [Len][Data]
-        if (data_len + 1 > slack_avail) {
+        // [Magic1][Magic2][Len][Data]
+        if (data_len + 3 > slack_avail) {
             unlock_buffer(bh);
             brelse(bh);
             return -EINVAL;
         }
-        ptr[offset] = (unsigned char)data_len;
-        memcpy(ptr + offset + 1, data, data_len);
+        ptr[offset]     = MAGIC_BYTE_1;
+        ptr[offset + 1] = MAGIC_BYTE_2;
+        ptr[offset + 2] = (unsigned char)data_len;
+        memcpy(ptr + offset + 3, data, data_len);
         mark_buffer_dirty(bh);
 
     } else if (mode == OP_CLEAR) {
@@ -69,15 +74,21 @@ static int raw_block_access(struct super_block *sb, u64 phys_block, int offset, 
 
     } else {
         // read logic
-        int stored_len = ptr[offset];
-        if (stored_len < 0) stored_len = 0;
-        if (stored_len > MAX_MSG_SIZE) stored_len = MAX_MSG_SIZE;
-        if (stored_len > slack_avail - 1) stored_len = slack_avail - 1;
+        if (ptr[offset] != MAGIC_BYTE_1 || ptr[offset + 1] != MAGIC_BYTE_2) {
+            pr_info("[%s] No magic bytes found at block %llu\n", MODULE_NAME, phys_block);
+            ret = -ENODATA;
+        } else {
+            int stored_len = ptr[offset + 2];
+            pr_info("[%s] stored_len=%d\n", MODULE_NAME, stored_len);
+            if (stored_len < 0) stored_len = 0;
+            if (stored_len > MAX_MSG_SIZE) stored_len = MAX_MSG_SIZE;
+            if (stored_len > slack_avail - 3) stored_len = slack_avail - 3;
 
-        if (stored_len > 0) {
-            if (data_len < stored_len) stored_len = data_len;
-            memcpy(data, ptr + offset + 1, stored_len);
-            ret = stored_len;
+            if (stored_len > 0) {
+                if (data_len < stored_len) stored_len = data_len;
+                memcpy(data, ptr + offset + 3, stored_len);
+                ret = stored_len;
+            }
         }
     }
 
