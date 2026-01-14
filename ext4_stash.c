@@ -1,8 +1,3 @@
-/**
- * ext4_stash.c
- * Block Slack Hider with 16-bit length support and chunking across multiple files
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
