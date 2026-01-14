@@ -1,8 +1,3 @@
-/**
- * ext4_stash.c
- * Fixed & Robust Block Slack Hider for Kernel 6.x
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
