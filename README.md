@@ -1,4 +1,4 @@
-# LKM: Hide data in slack space
+# ext4-stash: Hide data in file's slack space (ext4)
 
 Simple Linux Kernel module for hiding string in slack space of specified file.
 
