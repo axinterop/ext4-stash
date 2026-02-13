@@ -4,7 +4,7 @@ Simple Linux Kernel module for hiding string in slack space of specified file.
 
 # Description
 
-On initializiation module creates several procs: `/proc/hide`, `/proc/unhide` and `/proc/clear`. These procs are used to transfer data between user space and the kernel module. `cli.c` is used as a client to get pass and read data.
+On initializiation module creates several procs: `/proc/hide`, `/proc/unhide` and `/proc/clear`. These procs are used to transfer data between user space and the kernel module. `cli.c` is a client to pass data to the module and get data from it.
 
 ## Hiding
 
